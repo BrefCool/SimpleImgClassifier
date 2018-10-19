@@ -1,142 +1,283 @@
 import tensorflow as tf
 import os
+import functools
 import re
 import hashlib
+import tensorflow.contrib as tfcontrib
 from tensorflow.python.util import compat
 from tensorflow.python.platform import gfile
+from sklearn.model_selection import train_test_split
 
-FLAGS = None
-LOCAL_FILE_PATH = os.getcwd()
 
-MAX_NUM_IMAGES_PER_CLASS = 100000
+class DataPipeline(object):
 
-IMAGE_CHANNEL_COUNT = 3
-INPUT_IMAGE_WIDTH = 64
-INPUT_IMAGE_HEIGHT = 64
-LABEL_CLASSES = 2
-MINI_BATCH_SIZE = 100
+    def __init__(self, images_dir, labels_dir, image_size=None, image_channels=3, method="Classification"):
+        self.images_dir = images_dir
+        if image_size is None:
+            self.image_size = [64, 64]
+        else:
+            self.image_size = image_size
+        self.image_channels = image_channels
+        self.is_seg = (method == "Segmentation")
+        self.max_images = 10000000
+        self.labels_dir = labels_dir
+        self.labels_classes = 0
+        # records label's name with the number from 0 to labels_classes-1
+        self.label_name_val_dict = {}
 
-def parse_function(filename, label):
-    image_string = tf.read_file(filename)
-    decoded_image = tf.image.decode_jpeg(image_string, channels=IMAGE_CHANNEL_COUNT)
-    image = tf.image.convert_image_dtype(decoded_image, tf.float32)
-    resized_image = tf.image.resize_images(image, [INPUT_IMAGE_WIDTH, INPUT_IMAGE_HEIGHT])
+    def _process_pathnames(self, filename, label):
+        """
+        process image filename and label.
+        :param filename: image filename
+        :param label: expected label
+        :param is_seg: whether is image segmentation scenario
+        :return: image matrix: height X width X channels, label vector
+        """
+        image_string = tf.read_file(filename)
+        image = tf.image.decode_jpeg(image_string, channels=self.image_channels)
 
-    label = tf.one_hot(label, LABEL_CLASSES, axis=0)
-    return resized_image, label
+        if self.is_seg:
+            label_image_string = tf.read_file(label)
+            label_image = tf.image.decode_gif(label_image_string)[0]
+            label_image = label_image[:, :, 0]
+            label = tf.expand_dims(label_image, axis=-1)
+        else:
+            label = tf.one_hot(label, self.labels_classes, axis=0)
 
-def create_image_dataset(filenames, labels):
-    dataset = tf.data.Dataset.from_tensor_slices((filenames, labels))
-    dataset = dataset.shuffle(buffer_size=len(filenames))
-    dataset = dataset.map(parse_function)
-    dataset = dataset.batch(MINI_BATCH_SIZE)
-    dataset = dataset.prefetch(1)
-    return dataset
+        return image, label
 
-def create_image_lists(image_dir, testing_percentage, validation_percentage):
-  """Builds a list of training images from the file system.
+    def _flip_image(self, horizontal_flip, image, label):
+        """
+        flip the image( data augmentation )
+        :param horizontal_flip: whether flip horizontally or not
+        :param image: input image data
+        :return: flipped image data
+        """
+        if horizontal_flip:
+            flip_prob = tf.random_uniform([], 0.0, 1.0)
+            image, label = tf.cond(tf.less(flip_prob, 0.5),
+                            lambda: (tf.image.flip_left_right(image), tf.image.flip_left_right(label)),
+                            lambda: (image, label))
+        return image, label
 
-  Analyzes the sub folders in the image directory, splits them into stable
-  training, testing, and validation sets, and returns a data structure
-  describing the lists of images for each label and their paths.
+    def _shift_image(self, image, label, width_shift_range, height_shift_range):
+        """
+        shift image( data augmentation )
+        :param image: input image data
+        :param width_shift_range: shift range of image's width
+        :param height_shift_range: shift range of images's height
+        :return: shifted image data
+        """
+        if width_shift_range or height_shift_range:
+            if width_shift_range:
+                width_shift_range = tf.random_uniform([],
+                                                      -width_shift_range * self.image_size[1],
+                                                      width_shift_range * self.image_size[1])
+            if height_shift_range:
+                height_shift_range = tf.random_uniform([],
+                                                       -height_shift_range * self.image_size[0],
+                                                       height_shift_range * self.image_size[0])
+            # Translate both
+            image = tfcontrib.image.translate(image, [width_shift_range, height_shift_range])
+            label = tfcontrib.image.translate(label, [width_shift_range, height_shift_range])
 
-  Args:
-    image_dir: String path to a folder containing subfolders of images.
-    testing_percentage: Integer percentage of the images to reserve for tests.
-    validation_percentage: Integer percentage of images reserved for validation.
+        return image, label
 
-  Returns:
-    A dictionary containing an entry for each label subfolder, with images split
-    into training, testing, and validation sets within each label.
-  """
-  if not gfile.Exists(image_dir):
-    print("Image directory '" + image_dir + "' not found.")
-    return None
-  result = {}
-  sub_dirs = [x[0] for x in gfile.Walk(image_dir)]
-  # The root directory comes first, so skip it.
-  is_root_dir = True
-  for sub_dir in sub_dirs:
-    if is_root_dir:
-      is_root_dir = False
-      continue
-    extensions = ['jpg', 'jpeg', 'JPG', 'JPEG']
-    file_list = []
-    dir_name = os.path.basename(sub_dir)
-    if dir_name == image_dir:
-      continue
-    print("Looking for images in '" + dir_name + "'")
-    for extension in extensions:
-      file_glob = os.path.join(image_dir, dir_name, '*.' + extension)
-      file_list.extend(gfile.Glob(file_glob))
-    if not file_list:
-      print('No files found')
-      continue
-    if len(file_list) < 20:
-      print('WARNING: Folder has less than 20 images, which may cause issues.')
-    elif len(file_list) > MAX_NUM_IMAGES_PER_CLASS:
-      print('WARNING: Folder {} has more than {} images. Some images will '
-            'never be selected.'.format(dir_name, MAX_NUM_IMAGES_PER_CLASS))
-    label_name = re.sub(r'[^a-z0-9]+', ' ', dir_name.lower())
-    training_images = []
-    testing_images = []
-    validation_images = []
-    for file_name in file_list:
-      base_name = os.path.basename(file_name)
-      # We want to ignore anything after '_nohash_' in the file name when
-      # deciding which set to put an image in, the data set creator has a way of
-      # grouping photos that are close variations of each other. For example
-      # this is used in the plant disease data set to group multiple pictures of
-      # the same leaf.
-      hash_name = re.sub(r'_nohash_.*$', '', file_name)
-      # This looks a bit magical, but we need to decide whether this file should
-      # go into the training, testing, or validation sets, and we want to keep
-      # existing files in the same set even if more files are subsequently
-      # added.
-      # To do that, we need a stable way of deciding based on just the file name
-      # itself, so we do a hash of that and then use that to generate a
-      # probability value that we use to assign it.
-      hash_name_hashed = hashlib.sha1(compat.as_bytes(hash_name)).hexdigest()
-      percentage_hash = ((int(hash_name_hashed, 16) %
-                          (MAX_NUM_IMAGES_PER_CLASS + 1)) *
-                         (100.0 / MAX_NUM_IMAGES_PER_CLASS))
-      if percentage_hash < validation_percentage:
-        validation_images.append(file_name)
-      elif percentage_hash < (testing_percentage + validation_percentage):
-        testing_images.append(file_name)
-      else:
-        training_images.append(file_name)
-    result[label_name] = {
-        'dir': dir_name,
-        'training': training_images,
-        'testing': testing_images,
-        'validation': validation_images,
-    }
-  return result
+    def _image_label_preprocess(self,
+                                image,
+                                label,
+                                resize=None,
+                                scale=1,
+                                hue_delta=0,
+                                horizontal_flip=False,
+                                width_shift_range=0,
+                                height_shift_range=0):
+        """
+        image preprocess function
+        :param image: image data
+        :param resize: resize the image to some size, param resize is expected to be [width, height]
+        :param scale: scale image, e.g. scale=1, then all the value will multiply 1 / 255.0
+        :param hue_delta: adjust the hue of an RGB image by random factor
+        :param horizontal_flip: whether flip the image horizontally
+        :param width_shift_range: shift range of image's width
+        :param height_shift_range: shift range of image's height
+        :return:
+        """
+        if resize is not None:
+            image = tf.image.resize_images(image, resize)
+        if self.is_seg:
+            if hue_delta:
+                image = tf.image.random_hue(image, hue_delta)
+            if resize is not None:
+                label = tf.image.resize_images(label, resize)
+            image, label = self._flip_image(horizontal_flip, image, label)
+            image, label = self._shift_image(image, label, width_shift_range, height_shift_range)
+            label = tf.to_float(label) * scale
+        image = tf.to_float(image) * scale
+        return image, label
 
-def get_image_dataset(image_dir, testing_percentage, validation_percentage):
-    images = create_image_lists(image_dir, testing_percentage, validation_percentage)
-    class_count = len(images.keys())
-    if class_count == 0:
-        print('No valid folders of images found at ' + image_dir)
-        return -1
-    if class_count == 1:
-        print('Only one valid folder of images found at ' + image_dir +
-              ' - multiple classes are needed for classification.')
-        return -1
+    def get_baseline_dataset(self,
+                             filenames,
+                             labels,
+                             parse_fn,
+                             threads=5,
+                             batch_size=100,
+                             shuffle=True):
+        """
+        get the basic dataset based on the image filenames and all labels
+        :param filenames: image filenames
+        :param labels: a list containing all the label val or the label images filenames
+        :param parse_fn: the function to preprocess all the image and label data
+        :param threads: taking advantage of multithreading
+        :param batch_size: the batch size
+        :param shuffle: whether shuffle the dataset or not
+        :return:
+        """
+        dataset = tf.data.Dataset.from_tensor_slices((filenames, labels))
+        dataset = dataset.map(self._process_pathnames, num_parallel_calls=threads)
+        dataset = dataset.map(parse_fn, num_parallel_calls=threads)
+        if shuffle:
+            dataset = dataset.shuffle(len(filenames))
+        dataset = dataset.repeat().batch(batch_size)
 
-    curr_class = 0
-    result = {'testing': {'filenames': [], 'labels': []},
-              'training': {'filenames': [], 'labels': []},
-              'validation': {'filenames': [], 'labels': []}}
+        return dataset
 
-    for cls in images.keys():
-        for k in result.keys():
-            result[k]['filenames'] += images[cls][k]
-            result[k]['labels'] += [curr_class for _ in images[cls][k]]
-        curr_class += 1
-    
-    for k in result.keys():
-        result[k] = create_image_dataset(result[k]['filenames'], result[k]['labels'])
+    def extract_images_filenames_for_classify(self, vali_percentage):
+        if not gfile.Exists(self.images_dir):
+            print("Image directory '" + self.images_dir + "' not found.")
+            return None
+        result = {}
+        sub_dirs = [x[0] for x in gfile.Walk(self.images_dir)]
+        # The root directory comes first, so skip it.
+        is_root_dir = True
+        for sub_dir in sub_dirs:
+            if is_root_dir:
+                is_root_dir = False
+                continue
+            extensions = ['jpg', 'jpeg', 'png', 'gif']
+            file_list = []
+            dir_name = os.path.basename(sub_dir)
+            if dir_name == self.images_dir:
+                continue
+            print("Looking for images in '" + dir_name + "'")
+            for extension in extensions:
+                file_glob = os.path.join(self.images_dir, dir_name, '*.' + extension)
+                file_list.extend(gfile.Glob(file_glob))
+            if not file_list:
+                print('No files found')
+                continue
+            if len(file_list) < 20:
+                print('WARNING: Folder has less than 20 images, which may cause issues.')
+            elif len(file_list) > self.max_images:
+                print('WARNING: Folder {} has more than {} images. Some images will '
+                      'never be selected.'.format(dir_name, self.max_images))
 
-    return curr_class, result
+            label_name = re.sub(r'[^a-z0-9]+', ' ', dir_name.lower())
+            training_images, validation_images = train_test_split(file_list, test_size=vali_percentage)
+            result[label_name] = {
+                'dir': dir_name,
+                'training': training_images,
+                'validation': validation_images}
+        return result
+
+    def extract_images_filenames_for_segmentation(self, images_dir, vali_precentage):
+        if not gfile.Exists(images_dir):
+            print("Image directory '" + images_dir + "' not found.")
+            return None
+        result = {}
+        extensions = ['jpg', 'jpeg', 'png', 'gif']
+        file_list = []
+        for extension in extensions:
+            file_glob = os.path.join(images_dir, '*.' + extension)
+            file_list.extend(gfile.Glob(file_glob))
+        if not file_list:
+            print('No files found')
+            return None
+        if len(file_list) < 20:
+            print('WARNING: Folder has less than 20 images, which may cause issues.')
+        elif len(file_list) > self.max_images:
+            print('WARNING: Folder {} has more than {} images. Some images will '
+                  'never be selected.'.format(images_dir, self.max_images))
+        training_images, validation_images = train_test_split(file_list, test_size=vali_precentage)
+        result['segmentation'] = {
+            'dir': images_dir,
+            'training': training_images,
+            'validation': validation_images}
+
+        return result
+
+    def get_input_files(self, vali_percentage):
+        result = {'training': {'filenames': [], 'labels': []},
+                  'validation': {'filenames': [], 'labels': []}}
+        if self.is_seg:
+            images_filenames = self.extract_images_filenames_for_segmentation(self.images_dir, vali_percentage)
+            for k in result.keys():
+                result[k]["filenames"] = images_filenames["segmentation"][k]
+                for filename in result[k]["filenames"]:
+                    label_filename = os.path.basename(filename)
+                    label_filename = '{}_mask.gif'.format(os.path.basename(label_filename).split('.')[0])
+                    result[k]["labels"].append(os.path.join(self.labels_dir, label_filename))
+        else:
+            images_filenames = self.extract_images_filenames_for_classify(vali_percentage)
+            class_count = len(images_filenames.keys())
+            if class_count == 0:
+                print('No valid folders of images found at ' + self.images_dir)
+                return -1
+            if class_count == 1:
+                print('Only one valid folder of images found at ' + self.images_dir +
+                      ' - multiple classes are needed for classification.')
+                return -1
+            self.labels_classes = class_count
+            curr_class = 0
+
+            for cls in images_filenames.keys():
+                for k in result.keys():
+                    result[k]['filenames'] += images_filenames[cls][k]
+                    result[k]['labels'] += [curr_class for _ in images_filenames[cls][k]]
+                self.label_name_val_dict[curr_class] = cls
+                curr_class += 1
+
+        return result
+
+    def get_input_dataset(self, vali_percentage, batch_size):
+        result = {}
+        image_label_result = self.get_input_files(vali_percentage)
+
+        if self.is_seg:
+            train_cfg = {
+                'resize': [self.image_size[0], self.image_size[1]],
+                'scale': 1 / 255.,
+                'hue_delta': 0.1,
+                'horizontal_flip': True,
+                'width_shift_range': 0.1,
+                'height_shift_range': 0.1
+            }
+            vali_cfg = {
+                'resize': [self.image_size[0], self.image_size[1]],
+                'scale': 1 / 255.
+            }
+            train_processing_fn = functools.partial(self._image_label_preprocess, **train_cfg)
+            vali_processing_fn = functools.partial(self._image_label_preprocess, **vali_cfg)
+            result["training"] = self.get_baseline_dataset(image_label_result["training"]["filenames"],
+                                                           image_label_result["training"]["labels"],
+                                                           parse_fn=train_processing_fn,
+                                                           batch_size=batch_size)
+            result["validation"] = self.get_baseline_dataset(image_label_result["validation"]["filenames"],
+                                                             image_label_result["validation"]["labels"],
+                                                             parse_fn=vali_processing_fn,
+                                                             batch_size=batch_size)
+        else:
+            cfg = {
+                'resize': [self.image_size[0], self.image_size[1]],
+                'scale': 1 / 255.
+            }
+            image_processing_fn = functools.partial(self._image_label_preprocess, **cfg)
+            result["training"] = self.get_baseline_dataset(image_label_result["training"]["filenames"],
+                                                           image_label_result["training"]["labels"],
+                                                           parse_fn=image_processing_fn,
+                                                           batch_size=batch_size)
+            result["validation"] = self.get_baseline_dataset(image_label_result["validation"]["filenames"],
+                                                             image_label_result["validation"]["labels"],
+                                                             parse_fn=image_processing_fn,
+                                                             batch_size=batch_size)
+        return result
