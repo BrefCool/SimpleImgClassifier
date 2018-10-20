@@ -55,9 +55,14 @@ class DataPipeline(object):
         """
         if horizontal_flip:
             flip_prob = tf.random_uniform([], 0.0, 1.0)
-            image, label = tf.cond(tf.less(flip_prob, 0.5),
-                            lambda: (tf.image.flip_left_right(image), tf.image.flip_left_right(label)),
-                            lambda: (image, label))
+            if self.is_seg:
+                image, label = tf.cond(tf.less(flip_prob, 0.5),
+                                lambda: (tf.image.flip_left_right(image), tf.image.flip_left_right(label)),
+                                lambda: (image, label))
+            else:
+                image = tf.cond(tf.less(flip_prob, 0.5),
+                                lambda: tf.image.flip_left_right(image),
+                                lambda: image)
         return image, label
 
     def _shift_image(self, image, label, width_shift_range, height_shift_range):
@@ -79,7 +84,8 @@ class DataPipeline(object):
                                                        height_shift_range * self.image_size[0])
             # Translate both
             image = tfcontrib.image.translate(image, [width_shift_range, height_shift_range])
-            label = tfcontrib.image.translate(label, [width_shift_range, height_shift_range])
+            if self.is_seg:
+                label = tfcontrib.image.translate(label, [width_shift_range, height_shift_range])
 
         return image, label
 
@@ -105,13 +111,13 @@ class DataPipeline(object):
         """
         if resize is not None:
             image = tf.image.resize_images(image, resize)
+        if hue_delta:
+            image = tf.image.random_hue(image, hue_delta)
+        if self.is_seg and resize is not None:
+            label = tf.image.resize_images(label, resize)
+        image, label = self._flip_image(horizontal_flip, image, label)
+        image, label = self._shift_image(image, label, width_shift_range, height_shift_range)
         if self.is_seg:
-            if hue_delta:
-                image = tf.image.random_hue(image, hue_delta)
-            if resize is not None:
-                label = tf.image.resize_images(label, resize)
-            image, label = self._flip_image(horizontal_flip, image, label)
-            image, label = self._shift_image(image, label, width_shift_range, height_shift_range)
             label = tf.to_float(label) * scale
         image = tf.to_float(image) * scale
         return image, label
@@ -269,7 +275,11 @@ class DataPipeline(object):
         else:
             cfg = {
                 'resize': [self.image_size[0], self.image_size[1]],
-                'scale': 1 / 255.
+                'scale': 1 / 255.,
+                'hue_delta': 0.1,
+                'horizontal_flip': True,
+                'width_shift_range': 0.1,
+                'height_shift_range': 0.1
             }
             image_processing_fn = functools.partial(self._image_label_preprocess, **cfg)
             result["training"] = self.get_baseline_dataset(image_label_result["training"]["filenames"],

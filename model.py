@@ -22,7 +22,7 @@ class UnetModelGenerator(object):
 
     @staticmethod
     def bce_dice_loss(y_true, y_pred):
-        loss = losses.binary_crossentropy(y_true, y_pred) + UnetModel.dice_loss(y_true, y_pred)
+        loss = losses.binary_crossentropy(y_true, y_pred) + UnetModelGenerator.dice_loss(y_true, y_pred)
         return loss
 
     @staticmethod
@@ -82,14 +82,19 @@ class UnetModelGenerator(object):
         self.outputs = UnetModelGenerator.generate_outputs(self.inputs)
         self.keras_model = models.Model(inputs=[self.inputs], outputs=[self.outputs])
 
-    def sunmary(self):
-        self.keras_model.sunmary()
+    def summary(self):
+        self.keras_model.summary()
 
     def get_model(self):
         return self.keras_model
 # -------------------------------------------------------------------------------------------------------------
 # --------------------- self-designed sequential nn model( image classification ）-----------------------------
 class SeqNnModelGenerator(object):
+
+    @staticmethod
+    def loss(y_true, y_pred):
+        return losses.categorical_crossentropy(y_true, y_pred)
+
     def __init__(self, input_img_shape, num_classes):
         self.num_classes = num_classes
         self.inputs = layers.Input(shape=input_img_shape)
@@ -99,12 +104,43 @@ class SeqNnModelGenerator(object):
     def generate_outputs(self):
         flatterned = layers.Flatten()(self.inputs)
         d1 = layers.Dense(64, activation='relu')(flatterned)
-        d2 = layers.Dense(64, activation='relu')(d1)
-        outputs = layers.Dense(self.num_classes, activation='softmax')(d2)
+        d1_dropout = layers.Dropout(rate=0.25)(d1)
+        d2 = layers.Dense(128, activation='relu')(d1_dropout)
+        d2_dropout = layers.Dropout(rate=0.5)(d2)
+        outputs = layers.Dense(self.num_classes, activation='softmax')(d2_dropout)
         return outputs
 
-    def sunmary(self):
-        self.keras_model.sunmary()
+    def summary(self):
+        self.keras_model.summary()
+
+    def get_model(self):
+        return self.keras_model
+# -------------------------------------------------------------------------------------------------------
+# ---------------------------------- CNN model( image classification ) ----------------------------------
+class CnnModel(object):
+
+    def __init__(self, input_img_shape, num_classes):
+        self.num_classes = num_classes
+        self.inputs = layers.Input(shape=input_img_shape)
+        self.outputs = self.generate_outputs()
+        self.keras_model = models.Model(inputs=[self.inputs], outputs=[self.outputs])
+
+    def generate_outputs(self):
+        conv_l1 = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(self.inputs)
+        conv_l1 = layers.MaxPooling2D((2, 2), strides=(2, 2))(conv_l1)
+        conv_l2 = layers.Conv2D(64, (3, 3), padding='same', activation='relu')(conv_l1)
+        conv_l2 = layers.MaxPooling2D((2, 2), strides=(2, 2))(conv_l2)
+        conv_l3 = layers.Conv2D(128, (3, 3), padding='same', activation='relu')(conv_l2)
+        conv_l3 = layers.MaxPooling2D((2, 2), strides=(2, 2))(conv_l3)
+        l3_dropout = layers.Dropout(rate=0.5)(conv_l3)
+        flatterned = layers.Flatten()(l3_dropout)
+        l4 = layers.Dense(1024, activation='relu')(flatterned)
+        l4_droupout = layers.Dropout(rate=0.5)(l4)
+        outputs = layers.Dense(self.num_classes, activation='softmax')(l4_droupout)
+        return outputs
+
+    def summary(self):
+        self.keras_model.summary()
 
     def get_model(self):
         return self.keras_model
