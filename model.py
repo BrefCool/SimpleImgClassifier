@@ -144,3 +144,32 @@ class CnnModel(object):
 
     def get_model(self):
         return self.keras_model
+# ----------------------------------------------------------------------------------------------------------
+# ---------------------------------------Inception V3 Model-------------------------------------------------
+# class InceptionModel(object):
+#
+#     def __init__(self, input_img_shape, num_classes):
+#         self.num_classes = num_classes
+#         self.inputs = layers.Input(shape=input_img_shape)
+#         self.outputs = self.generate_outputs()
+#         self.keras_model = models.
+#
+#     def generate_outputs(self):
+#         conv_l1 = layers.Conv2D(32, (3, 3), padding='same', activation='relu')(self.inputs)
+#         conv_l1 = layers.MaxPooling2D((2, 2), strides=(2, 2))(conv_l1)
+#         conv_l2 = layers.Conv2D(64, (3, 3), padding='same', activation='relu')(conv_l1)
+#         conv_l2 = layers.MaxPooling2D((2, 2), strides=(2, 2))(conv_l2)
+#         conv_l3 = layers.Conv2D(128, (3, 3), padding='same', activation='relu')(conv_l2)
+#         conv_l3 = layers.MaxPooling2D((2, 2), strides=(2, 2))(conv_l3)
+#         l3_dropout = layers.Dropout(rate=0.5)(conv_l3)
+#         flatterned = layers.Flatten()(l3_dropout)
+#         l4 = layers.Dense(1024, activation='relu')(flatterned)
+#         l4_droupout = layers.Dropout(rate=0.5)(l4)
+#         outputs = layers.Dense(self.num_classes, activation='softmax')(l4_droupout)
+#         return outputs
+#
+#     def summary(self):
+#         self.keras_model.summary()
+#
+#     def get_model(self):
+#         return self.keras_model

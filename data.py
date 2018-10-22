@@ -2,9 +2,7 @@ import tensorflow as tf
 import os
 import functools
 import re
-import hashlib
 import tensorflow.contrib as tfcontrib
-from tensorflow.python.util import compat
 from tensorflow.python.platform import gfile
 from sklearn.model_selection import train_test_split
 
@@ -24,6 +22,31 @@ class DataPipeline(object):
         self.labels_classes = 0
         # records label's name with the number from 0 to labels_classes-1
         self.label_name_val_dict = {}
+        self.training_count = 0
+        self.testing_count = 0
+        self.validation_count = 0
+        self.update_labels_info(labels_dir)
+
+    def update_labels_info(self, labels_dir):
+        if not self.is_seg:
+            with open(labels_dir, 'r') as labels_file:
+                is_first_line = True
+                for line in labels_file:
+                    if is_first_line or line[0] == '\n':
+                        is_first_line = False
+                        continue
+                    filename = line.split(',')[0]
+                    label = line.split(',')[1]
+                    self.label_name_val_dict[filename] = int(label)
+            self.labels_classes = len(self.label_name_val_dict.keys())
+
+    def _process_bottleneck(self, filename, label):
+        bottleneck_string = tf.read_file(filename)
+        bottleneck_values = tf.string_split([bottleneck_string], ',').values
+        bottleneck = tf.strings.to_number(bottleneck_values, out_type=tf.float32)
+        bottleneck = tf.reshape(bottleneck, [2048])
+        label = tf.one_hot(label, self.labels_classes, axis=0)
+        return bottleneck, label
 
     def _process_pathnames(self, filename, label):
         """
@@ -122,6 +145,14 @@ class DataPipeline(object):
         image = tf.to_float(image) * scale
         return image, label
 
+    def get_bottleneck_dataset(self, filenames, labels, threads=5, batch_size=100, shuffle=True):
+        dataset = tf.data.Dataset.from_tensor_slices((filenames, labels))
+        dataset = dataset.map(self._process_bottleneck, num_parallel_calls=threads)
+        if shuffle:
+            dataset = dataset.shuffle(len(filenames))
+        dataset = dataset.repeat().batch(batch_size)
+        return dataset
+
     def get_baseline_dataset(self,
                              filenames,
                              labels,
@@ -148,7 +179,7 @@ class DataPipeline(object):
 
         return dataset
 
-    def extract_images_filenames_for_classify(self, vali_percentage):
+    def extract_filenames_for_classify(self, vali_percentage, extensions):
         if not gfile.Exists(self.images_dir):
             print("Image directory '" + self.images_dir + "' not found.")
             return None
@@ -160,7 +191,6 @@ class DataPipeline(object):
             if is_root_dir:
                 is_root_dir = False
                 continue
-            extensions = ['jpg', 'jpeg', 'png', 'gif']
             file_list = []
             dir_name = os.path.basename(sub_dir)
             if dir_name == self.images_dir:
@@ -212,9 +242,37 @@ class DataPipeline(object):
 
         return result
 
+    def get_input_bottleneck(self, vali_percentage):
+        result = {'training': {'filenames': [], 'labels': []},
+                  'validation': {'filenames': [], 'labels': []},
+                  # 'testing': {'filenames': [], 'labels': []},
+        }
+        if not self.is_seg:
+            filenames = self.extract_filenames_for_classify(vali_percentage, ['txt'])
+            class_count = len(filenames.keys())
+            if class_count == 0:
+                print('No valid folders of images found at ' + self.images_dir)
+                return -1
+            if class_count == 1:
+                print('Only one valid folder of images found at ' + self.images_dir +
+                      ' - multiple classes are needed for classification.')
+                return -1
+
+            for cls in filenames.keys():
+                for k in result.keys():
+                    result[k]['filenames'] += filenames[cls][k]
+                    result[k]['labels'] += [self.label_name_val_dict[cls] for _ in filenames[cls][k]]
+
+        self.training_count = len(result["training"]["filenames"])
+        self.validation_count = len(result["validation"]["filenames"])
+
+        return result
+
     def get_input_files(self, vali_percentage):
         result = {'training': {'filenames': [], 'labels': []},
-                  'validation': {'filenames': [], 'labels': []}}
+                  'validation': {'filenames': [], 'labels': []},
+                  #'testing': {'filenames': [], 'labels': []},
+        }
         if self.is_seg:
             images_filenames = self.extract_images_filenames_for_segmentation(self.images_dir, vali_percentage)
             for k in result.keys():
@@ -224,7 +282,7 @@ class DataPipeline(object):
                     label_filename = '{}_mask.gif'.format(os.path.basename(label_filename).split('.')[0])
                     result[k]["labels"].append(os.path.join(self.labels_dir, label_filename))
         else:
-            images_filenames = self.extract_images_filenames_for_classify(vali_percentage)
+            images_filenames = self.extract_filenames_for_classify(vali_percentage, ['png', 'jpg', 'jpeg'])
             class_count = len(images_filenames.keys())
             if class_count == 0:
                 print('No valid folders of images found at ' + self.images_dir)
@@ -233,16 +291,28 @@ class DataPipeline(object):
                 print('Only one valid folder of images found at ' + self.images_dir +
                       ' - multiple classes are needed for classification.')
                 return -1
-            self.labels_classes = class_count
-            curr_class = 0
 
             for cls in images_filenames.keys():
                 for k in result.keys():
                     result[k]['filenames'] += images_filenames[cls][k]
-                    result[k]['labels'] += [curr_class for _ in images_filenames[cls][k]]
-                self.label_name_val_dict[curr_class] = cls
-                curr_class += 1
+                    result[k]['labels'] += [self.label_name_val_dict[cls] for _ in images_filenames[cls][k]]
 
+        self.training_count = len(result["training"]["filenames"])
+        self.validation_count = len(result["validation"]["filenames"])
+
+        return result
+
+    def get_input_bottleneck_ds(self, vali_percentage, batch_size):
+        result = {}
+        image_label_result = self.get_input_bottleneck(vali_percentage)
+
+        if not self.is_seg:
+            result["training"] = self.get_bottleneck_dataset(image_label_result["training"]["filenames"],
+                                                             image_label_result["training"]["labels"],
+                                                             batch_size=batch_size)
+            result["validation"] = self.get_bottleneck_dataset(image_label_result["validation"]["filenames"],
+                                                               image_label_result["validation"]["labels"],
+                                                               batch_size=batch_size)
         return result
 
     def get_input_dataset(self, vali_percentage, batch_size):
